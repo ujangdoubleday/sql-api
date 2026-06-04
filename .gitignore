@@ -1,0 +1,9 @@
+.claude/
+
+# Binary
+sql-api
+sql-api-linux
+sql-api.exe
+
+# Environment
+.env
