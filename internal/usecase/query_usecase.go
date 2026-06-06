@@ -3,6 +3,7 @@ package usecase
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/xwb1989/sqlparser"
@@ -13,28 +14,56 @@ import (
 type queryUsecase struct {
 	repo            domain.QueryRepository
 	queryTimeoutSec int
+	driver          string
 }
 
 // NewQueryUsecase wires the usecase with its repository dependency.
-func NewQueryUsecase(repo domain.QueryRepository, queryTimeoutSec int) domain.QueryUsecase {
-	return &queryUsecase{repo: repo, queryTimeoutSec: queryTimeoutSec}
+func NewQueryUsecase(repo domain.QueryRepository, queryTimeoutSec int, driver string) domain.QueryUsecase {
+	return &queryUsecase{repo: repo, queryTimeoutSec: queryTimeoutSec, driver: driver}
 }
 
 func (uc *queryUsecase) ProcessQuery(ctx context.Context, req *domain.QueryRequest) (*domain.QueryResult, error) {
-	stmt, err := sqlparser.Parse(req.Query)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %s", domain.ErrSQLParseFailed, err.Error())
-	}
+	var (
+		mode domain.ExecuteMode
+		err  error
+	)
 
-	mode, err := validateAndClassify(stmt)
-	if err != nil {
-		return nil, err
+	if uc.driver == "sqlserver" {
+		mode = classifyForSQLServer(req.Query)
+	} else {
+		var stmt sqlparser.Statement
+		stmt, err = sqlparser.Parse(req.Query)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %s", domain.ErrSQLParseFailed, err.Error())
+		}
+		mode, err = validateAndClassify(stmt)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	execCtx, cancel := context.WithTimeout(ctx, time.Duration(uc.queryTimeoutSec)*time.Second)
 	defer cancel()
 
 	return uc.repo.Execute(execCtx, req.Query, mode)
+}
+
+func classifyForSQLServer(query string) domain.ExecuteMode {
+	switch firstKeyword(query) {
+	case "SELECT", "WITH", "EXEC", "EXECUTE":
+		return domain.ExecModeQuery
+	default:
+		return domain.ExecModeExec
+	}
+}
+
+// firstKeyword returns the uppercased first whitespace-delimited token of a query.
+func firstKeyword(query string) string {
+	fields := strings.Fields(query)
+	if len(fields) == 0 {
+		return ""
+	}
+	return strings.ToUpper(fields[0])
 }
 
 // validateAndClassify enforces the statement allowlist and returns the execute mode.
