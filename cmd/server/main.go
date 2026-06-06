@@ -1,12 +1,15 @@
 package main
 
 import (
+	"errors"
+	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
-
-	"github.com/joho/godotenv"
+	"strconv"
+	"syscall"
 
 	"sql-api/internal/config"
 	httpdelivery "sql-api/internal/delivery/http"
@@ -15,12 +18,12 @@ import (
 )
 
 func main() {
-	// Wire structured JSON logging globally.
+	envFile := flag.String("env", "", "path to .env file (default: .env in current dir, then ~/.config/sql-api/.env)")
+	flag.Parse()
+
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 
-	if err := godotenv.Load(); err != nil {
-		slog.Warn("no .env file found, falling back to environment variables")
-	}
+	config.LoadEnv(*envFile)
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -42,7 +45,6 @@ func main() {
 		"conn_max_lifetime", cfg.DBConnMaxLifetime.String(),
 	)
 
-	// Dependency injection — outermost layer wires everything together.
 	queryRepo := repository.NewSQLRepository(db)
 	queryUC := usecase.NewQueryUsecase(queryRepo, cfg.QueryTimeoutSeconds, cfg.DBDriver)
 	handler := httpdelivery.NewHandler(queryUC)
@@ -52,11 +54,41 @@ func main() {
 	mux.HandleFunc("GET /health", healthHandler.Health)
 	mux.HandleFunc("POST /api/v1/execute", handler.Execute)
 
-	addr := fmt.Sprintf(":%s", cfg.ServerPort)
-	slog.Info("server listening", "addr", addr)
+	port, err := strconv.Atoi(cfg.ServerPort)
+	if err != nil {
+		slog.Error("invalid SERVER_PORT", "error", err)
+		os.Exit(1)
+	}
 
-	if err := http.ListenAndServe(addr, mux); err != nil {
+	ln, port := listenWithFallback(port)
+	slog.Info("server listening", "addr", fmt.Sprintf(":%d", port))
+
+	if err := http.Serve(ln, mux); err != nil {
 		slog.Error("server error", "error", err)
 		os.Exit(1)
 	}
+}
+
+// listenWithFallback tries to bind starting at port, incrementing until it finds a free one.
+func listenWithFallback(port int) (net.Listener, int) {
+	for {
+		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+		if err == nil {
+			return ln, port
+		}
+		if isPortInUse(err) {
+			port++
+			continue
+		}
+		slog.Error("failed to bind port", "error", err)
+		os.Exit(1)
+	}
+}
+
+func isPortInUse(err error) bool {
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return errors.Is(opErr.Err, syscall.EADDRINUSE)
+	}
+	return false
 }
