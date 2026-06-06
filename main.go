@@ -44,7 +44,7 @@ func main() {
 
 	// Dependency injection — outermost layer wires everything together.
 	queryRepo := repository.NewSQLRepository(db)
-	queryUC := usecase.NewQueryUsecase(queryRepo, cfg.QueryTimeoutSeconds)
+	queryUC := usecase.NewQueryUsecase(queryRepo, cfg.QueryTimeoutSeconds, cfg.DBDriver)
 	handler := httpdelivery.NewHandler(queryUC)
 	healthHandler := httpdelivery.NewHealthHandler(db)
 
