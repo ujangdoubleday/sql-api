@@ -1,6 +1,6 @@
 # sql-api
 
-A REST API that acts as a secure bridge for AI Agents to execute SQL queries against a database. Built with Go's standard library and Clean Architecture. Supports MySQL, PostgreSQL, and SQL Server (full T-SQL support).
+A REST API that acts as a secure bridge for AI Agents to execute SQL queries against configured databases. Built with Go's standard library and Clean Architecture. Supports MySQL, PostgreSQL, and SQL Server (full T-SQL support).
 
 ---
 
@@ -8,7 +8,7 @@ A REST API that acts as a secure bridge for AI Agents to execute SQL queries aga
 
 | Tool | Version |
 |---|---|
-| [Go](https://go.dev/dl/) | 1.22 or later |
+| [Go](https://go.dev/dl/) | 1.24 or later |
 | A running database | MySQL, PostgreSQL, or SQL Server |
 
 ---
@@ -85,6 +85,45 @@ QUERY_TIMEOUT_SECONDS=10
 | `postgres` | `postgres://user:pass@host:5432/dbname?sslmode=disable` |
 | `sqlserver` | `sqlserver://user:pass@host:1433?database=dbname` |
 
+### Multiple databases
+
+Use named environment variables in the same `.env` file or process environment:
+
+```dotenv
+DATABASES=main,reporting
+DEFAULT_DATABASE=main
+
+DB_MAIN_DRIVER=mysql
+DB_MAIN_DSN="app:example@tcp(mysql.internal:3306)/app?parseTime=true"
+DB_REPORTING_DRIVER=postgres
+DB_REPORTING_DSN="postgres://reporter:example@postgres.internal:5432/reporting?sslmode=require"
+
+DB_MAX_OPEN_CONNS=25
+DB_MAX_IDLE_CONNS=5
+DB_CONN_MAX_LIFETIME_MINUTES=5
+DB_REPORTING_MAX_OPEN_CONNS=10
+DB_REPORTING_MAX_IDLE_CONNS=2
+DB_REPORTING_CONN_MAX_LIFETIME_MINUTES=10
+
+SERVER_PORT=8080
+QUERY_TIMEOUT_SECONDS=10
+```
+
+- `DATABASES` is a comma-separated list of unique, case-sensitive aliases matching `[a-z][a-z0-9_]*`. Spaces around list entries are ignored. Each alias uses its uppercase form in the `DB_<ALIAS>_` prefix.
+- Every named database requires `DRIVER` and `DSN`. `DEFAULT_DATABASE` must name one of them. DSNs contain the host, port, credentials, database name, and driver-specific options.
+- Shared pool settings apply independently to each database; `DB_<ALIAS>_MAX_OPEN_CONNS`, `MAX_IDLE_CONNS`, and `CONN_MAX_LIFETIME_MINUTES` override them. Budget connections across all application instances: this example permits up to 35 open connections per instance.
+- Maximum open connections and query timeout must be positive. Idle connections and lifetime must be nonnegative; idle cannot exceed open. A zero lifetime disables lifetime-based recycling. Invalid or empty numeric settings fail configuration loading.
+- When `DATABASES` is present, legacy `DB_DRIVER`/`DB_DSN` are ignored; an empty list is an error. Without it, legacy settings work unchanged under alias `default`.
+- Existing `.env` resolution still applies. Process environment values take precedence over values loaded from a file. Restart after configuration changes.
+
+The server builds a separate pool, repository, and driver-specific usecase for each alias. The HTTP handler selects a usecase from a read-only map; no shared current-database state is changed. All pools must connect at startup, with each connectivity check bounded by `QUERY_TIMEOUT_SECONDS`. A failure closes already-opened pools and stops startup. SIGINT/SIGTERM drains HTTP requests before pool cleanup, bounded by the larger of the query timeout and three seconds.
+
+During operation, a failed database affects its own queries; requests never fall back to another database or automatically replay SQL. Health reports failures across all pools. Connection setup and health errors omit driver details that could reveal credentials.
+
+Aliases select connections, not authorization boundaries. Database credentials still govern access, including cross-database SQL where the database permits it. Existing driver-specific SQL validation is unchanged.
+
+**Migration:** existing users need no changes. To enable named mode, add the named settings and move the existing DSN into the default alias's DSN setting. `/api/v1/execute` continues to use that default. Local `.env.*` files are ignored by Git, except `.env.example`.
+
 ---
 
 ## Build & Install
@@ -152,9 +191,12 @@ If `SERVER_PORT` is already in use, the server automatically tries the next port
 
 ## CLI
 
-The CLI connects directly to the database using the same config resolution as the server. Output is JSON to stdout; errors go to stderr.
+The CLI connects directly to the selected database using the same config resolution as the server. It opens only the selected pool, so another configured database being offline does not block the command. Output is JSON to stdout; errors go to stderr.
 
 ```bash
+# Named database
+sql-cli -database reporting -q "SELECT 1"
+
 # Inline query
 sql-cli -q "SELECT TRY_CAST('123' AS INT) AS val"
 
@@ -173,6 +215,7 @@ sql-cli -q "SELECT TOP 5 * FROM orders" | jq '.rows'
 | `-q "..."` | SQL query string |
 | `-f file.sql` | Path to a `.sql` file |
 | `-env file` | Path to `.env` file |
+| `-database alias` | Select a configured database; defaults to `DEFAULT_DATABASE` (or `default` in legacy mode) |
 
 Example output:
 
@@ -192,7 +235,7 @@ Example output:
 
 ### `GET /health`
 
-Liveness + readiness check. Pings the database and reports its status.
+Readiness check. Pings all configured databases concurrently within a shared three-second deadline. Returns 503 when any database is unavailable.
 
 **200 OK**
 
@@ -203,14 +246,32 @@ Liveness + readiness check. Pings the database and reports its status.
 **503 Service Unavailable**
 
 ```json
-{ "status": "degraded", "database": "unreachable: ..." }
+{ "status": "degraded", "database": "unreachable" }
 ```
 
----
+Named mode additionally includes per-alias statuses:
+
+```json
+{
+  "status": "degraded",
+  "database": "unreachable",
+  "databases": { "main": "ok", "reporting": "unreachable" }
+}
+```
+
+### `POST /api/v1/{database}/execute`
+
+Execute against an explicit configured alias. The JSON request and response match the default endpoint below. Unknown aliases return `404` with `{"error":"unknown database alias"}`; no SQL is executed.
+
+```bash
+curl -s -X POST http://localhost:8080/api/v1/reporting/execute \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"SELECT 1 AS ping","context":"reporting check"}'
+```
 
 ### `POST /api/v1/execute`
 
-Execute a SQL statement.
+Execute a SQL statement against the configured default database.
 
 **Request**
 
@@ -276,6 +337,8 @@ Content-Type: application/json
 ```json
 { "error": "SQL Execution Error: Invalid object name 'unknown_table'" }
 ```
+
+**504 Gateway Timeout** — the query context deadline expired.
 
 ---
 
@@ -346,3 +409,28 @@ sql-api/
         ├── handler.go        # POST /api/v1/execute
         └── health.go         # GET /health
 ```
+
+
+## Tests
+
+```bash
+go test -race ./...
+go vet ./...
+go build ./cmd/server ./cmd/cli
+```
+
+Unit tests cover config validation and legacy compatibility, concurrent routing, driver-specific SQL classification, deadline mapping, pool startup cleanup, and aggregate health.
+
+The opt-in integration test requires exactly two named **test databases**, configured through process environment variables (it does not load `.env`). In each, provision this table with exactly one row and use different marker values:
+
+```sql
+CREATE TABLE sql_api_test_marker (marker VARCHAR(100) NOT NULL);
+INSERT INTO sql_api_test_marker (marker) VALUES ('main');
+-- Use 'reporting' instead in the second database.
+```
+
+```bash
+SQL_API_INTEGRATION=1 go test -race ./internal/delivery/http -run TestMultiDatabaseIntegration -v
+```
+
+The test only reads fixture data. It verifies both aliases and the default route against the markers, then closes one local pool to simulate unavailability and verifies that the other still works and health becomes degraded. It does not stop or modify database servers.
