@@ -45,7 +45,12 @@ func (uc *queryUsecase) ProcessQuery(ctx context.Context, req *domain.QueryReque
 	execCtx, cancel := context.WithTimeout(ctx, time.Duration(uc.queryTimeoutSec)*time.Second)
 	defer cancel()
 
-	return uc.repo.Execute(execCtx, req.Query, mode)
+	result, err := uc.repo.Execute(execCtx, req.Query, mode)
+	// Drivers can report their own error when a context deadline expires.
+	if err != nil && execCtx.Err() != nil {
+		return nil, fmt.Errorf("SQL execution canceled: %w", execCtx.Err())
+	}
+	return result, err
 }
 
 func classifyForSQLServer(query string) domain.ExecuteMode {
