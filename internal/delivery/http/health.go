@@ -5,44 +5,60 @@ import (
 	"database/sql"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 )
 
-// HealthHandler handles infrastructure-level health checks.
-// It intentionally holds *sql.DB directly — health is an infrastructure concern,
-// not a business one, so bypassing the usecase layer here is appropriate.
+// HealthHandler checks infrastructure directly, outside the query usecase.
 type HealthHandler struct {
-	db *sql.DB
+	databases map[string]*sql.DB
+	named     bool
 }
 
-// NewHealthHandler constructs the HealthHandler.
-func NewHealthHandler(db *sql.DB) *HealthHandler {
-	return &HealthHandler{db: db}
+// NewHealthHandler uses named to enable per-alias statuses in the response.
+func NewHealthHandler(databases map[string]*sql.DB, named bool) *HealthHandler {
+	return &HealthHandler{databases: databases, named: named}
 }
 
 type healthResponse struct {
-	Status   string `json:"status"`
-	Database string `json:"database"`
+	Status    string            `json:"status"`
+	Database  string            `json:"database"`
+	Databases map[string]string `json:"databases,omitempty"`
 }
 
-// Health handles GET /health.
-// Returns 200 when the server and database are reachable, 503 otherwise.
+// Health returns 200 only when all configured databases are reachable.
 func (h *HealthHandler) Health(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 	defer cancel()
-
-	resp := healthResponse{
-		Status:   "ok",
-		Database: "ok",
+	statuses := make(map[string]string, len(h.databases))
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for name, db := range h.databases {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			status := "ok"
+			if err := db.PingContext(ctx); err != nil {
+				status = "unreachable"
+				slog.Error("health check: database unreachable", "database", name)
+			}
+			mu.Lock()
+			statuses[name] = status
+			mu.Unlock()
+		}()
 	}
-	httpStatus := http.StatusOK
-
-	if err := h.db.PingContext(ctx); err != nil {
-		slog.Error("health check: database unreachable", "error", err)
-		resp.Status = "degraded"
-		resp.Database = "unreachable: " + err.Error()
-		httpStatus = http.StatusServiceUnavailable
+	wg.Wait()
+	resp := healthResponse{Status: "ok", Database: "ok"}
+	code := http.StatusOK
+	for _, status := range statuses {
+		if status != "ok" {
+			resp.Status = "degraded"
+			resp.Database = "unreachable"
+			code = http.StatusServiceUnavailable
+		}
 	}
-
-	writeJSON(w, httpStatus, resp)
+	if h.named {
+		resp.Databases = statuses
+	}
+	writeJSON(w, code, resp)
 }
