@@ -5,3 +5,6 @@ bin/
 
 # Environment
 .env
+
+.env.*
+!.env.example
