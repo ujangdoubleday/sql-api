@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"os"
 	"regexp"
 	"sort"
@@ -11,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	_ "github.com/denisenkom/go-mssqldb"
+	mssql "github.com/denisenkom/go-mssqldb"
 	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/lib/pq"
 )
@@ -124,13 +125,10 @@ func validateDatabase(name string, cfg DatabaseConfig) error {
 
 // NewDB returns a verified pool. Driver errors are withheld because they can contain credentials.
 func NewDB(ctx context.Context, cfg DatabaseConfig) (*sql.DB, error) {
-	db, err := sql.Open(cfg.Driver, cfg.DSN)
+	db, err := openDB(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("cannot open database; check driver and DSN")
+		return nil, err
 	}
-	db.SetMaxOpenConns(cfg.MaxOpenConns)
-	db.SetMaxIdleConns(cfg.MaxIdleConns)
-	db.SetConnMaxLifetime(cfg.ConnMaxLifetime)
 	if err := db.PingContext(ctx); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("database connectivity check failed; check connection settings and availability")
@@ -138,7 +136,32 @@ func NewDB(ctx context.Context, cfg DatabaseConfig) (*sql.DB, error) {
 	return db, nil
 }
 
+func openDB(cfg DatabaseConfig) (*sql.DB, error) {
+	var db *sql.DB
+	if cfg.Driver == "sqlserver" {
+		// sql.Open would route through mssql's Driver.Open, which dials with context.Background()
+		// and ignores our deadlines; the connector path honors them.
+		c, err := mssql.NewConnector(cfg.DSN)
+		if err != nil {
+			return nil, fmt.Errorf("cannot open database; check driver and DSN")
+		}
+		db = sql.OpenDB(c)
+	} else {
+		var err error
+		if db, err = sql.Open(cfg.Driver, cfg.DSN); err != nil {
+			return nil, fmt.Errorf("cannot open database; check driver and DSN")
+		}
+	}
+	db.SetMaxOpenConns(cfg.MaxOpenConns)
+	db.SetMaxIdleConns(cfg.MaxIdleConns)
+	db.SetConnMaxLifetime(cfg.ConnMaxLifetime)
+	// Drop idle connections quickly so ones killed by a network change (e.g. VPN reconnect) aren't reused.
+	db.SetConnMaxIdleTime(time.Minute)
+	return db, nil
+}
+
 // OpenDatabases owns startup cleanup; the caller owns the returned pools.
+// An unreachable database is kept (and logged) so it recovers once the network allows; only bad configuration is fatal.
 func OpenDatabases(ctx context.Context, cfg *Config) (map[string]*sql.DB, error) {
 	pools := make(map[string]*sql.DB)
 	names := make([]string, 0, len(cfg.Databases))
@@ -147,14 +170,17 @@ func OpenDatabases(ctx context.Context, cfg *Config) (map[string]*sql.DB, error)
 	}
 	sort.Strings(names)
 	for _, name := range names {
-		pingCtx, cancel := context.WithTimeout(ctx, time.Duration(cfg.QueryTimeoutSeconds)*time.Second)
-		db, err := NewDB(pingCtx, cfg.Databases[name])
-		cancel()
+		db, err := openDB(cfg.Databases[name])
 		if err != nil {
 			CloseDatabases(pools)
 			return nil, fmt.Errorf("database %q: %w", name, err)
 		}
 		pools[name] = db
+		pingCtx, cancel := context.WithTimeout(ctx, time.Duration(cfg.QueryTimeoutSeconds)*time.Second)
+		if err := db.PingContext(pingCtx); err != nil {
+			slog.Warn("database unreachable at startup; will retry on use", "database", name)
+		}
+		cancel()
 	}
 	return pools, nil
 }

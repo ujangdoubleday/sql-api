@@ -105,21 +105,16 @@ func TestPoolLifecycle(t *testing.T) {
 			cfg.Databases["b"] = db
 		}
 		pools, err := OpenDatabases(context.Background(), cfg)
-		if fail {
-			if err == nil || !strings.Contains(err.Error(), `database "b"`) || strings.Contains(err.Error(), "secret") {
-				t.Fatalf("unsafe or missing error: %v", err)
-			}
-		} else {
-			if err != nil || len(pools) != 2 {
-				t.Fatalf("open: %v", err)
-			}
-			if pools["a"].Stats().MaxOpenConnections != 2 {
-				t.Fatal("pool settings not applied")
-			}
-			CloseDatabases(pools)
-			if pools["a"].Ping() == nil {
-				t.Fatal("pool remains open")
-			}
+		// An unreachable database must not abort startup.
+		if err != nil || len(pools) != 2 {
+			t.Fatalf("open (fail=%v): %v", fail, err)
+		}
+		if pools["a"].Stats().MaxOpenConnections != 2 {
+			t.Fatal("pool settings not applied")
+		}
+		CloseDatabases(pools)
+		if pools["a"].Ping() == nil {
+			t.Fatal("pool remains open")
 		}
 		if closed.Load() != 2 {
 			t.Fatalf("closed %d connections, want 2", closed.Load())
