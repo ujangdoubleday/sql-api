@@ -55,7 +55,7 @@ func run(ctx context.Context) error {
 	for name, db := range pools {
 		dbCfg := cfg.Databases[name]
 		queryUCs[name] = usecase.NewQueryUsecase(repository.NewSQLRepository(db), cfg.QueryTimeoutSeconds, dbCfg.Driver)
-		slog.Info("database connected", "database", name, "driver", dbCfg.Driver,
+		slog.Info("database configured", "database", name, "driver", dbCfg.Driver,
 			"max_open_conns", dbCfg.MaxOpenConns, "max_idle_conns", dbCfg.MaxIdleConns,
 			"conn_max_lifetime", dbCfg.ConnMaxLifetime.String())
 	}
